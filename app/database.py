@@ -105,6 +105,34 @@ CREATE TABLE IF NOT EXISTS proposals (
 
 CREATE INDEX IF NOT EXISTS idx_proposals_base ON proposals(base_version_id);
 CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status);
+
+-- 根因结论签发：从已封榜盲评场签发一个不可变的最终根因集合。
+-- 表为只追加（append-only）：UPDATE / DELETE 由触发器直接拒绝；
+-- 每场评审场至多一条（session_id 唯一）；记录只引用版本 / 评审场 id 并自带
+-- 规范化 payload 与 SHA-256 摘要，后续图版本变化不影响记录内容。
+CREATE TABLE IF NOT EXISTS root_cause_issuances (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id       INTEGER NOT NULL UNIQUE REFERENCES review_sessions(id),
+    version_id       INTEGER NOT NULL REFERENCES versions(id),
+    note             TEXT NOT NULL,                 -- 签发说明
+    payload_json     TEXT NOT NULL CHECK (json_valid(payload_json)),  -- 规范化结论 payload（紧凑、键排序）
+    package_json     TEXT NOT NULL CHECK (json_valid(package_json)),  -- 含 digest 的完整签发文件
+    digest_algorithm TEXT NOT NULL,
+    digest           TEXT NOT NULL,                 -- payload 规范化 JSON 的 SHA-256
+    issued_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_root_cause_issuance_no_update
+BEFORE UPDATE ON root_cause_issuances
+BEGIN
+    SELECT RAISE(ABORT, 'root_cause_issuances 为只追加表，签发记录不可修改');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_root_cause_issuance_no_delete
+BEFORE DELETE ON root_cause_issuances
+BEGIN
+    SELECT RAISE(ABORT, 'root_cause_issuances 为只追加表，签发记录不可删除');
+END;
 """
 
 # (id, type, title, desc, x, y, earliest_time_utc, latest_time_utc, reliability, source_group, trigger_mode)

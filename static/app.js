@@ -1667,10 +1667,15 @@ function renderPkgVerify(fname, r) {
 const reviewUI = {
   sessions: [],       // 评审场列表
   detail: null,       // 当前打开的评审场详情
-  tab: 'vote',        // vote | ranks | matrix
+  tab: 'vote',        // vote | ranks | matrix | issuance
   voter: '',          // 投票页选择的评审人
   ranking: [],        // 正在编辑的严格排序（node_id 数组）
   createEvents: [],   // 建场表单所选版本的事件列表
+  // 根因结论签发页
+  issueSel: null,     // 勾选的最终根因集合 Set（首次进入按最高并列名次初始化）
+  issueNote: '',      // 签发说明
+  issueReport: null,  // 最近一次只读预检 / 失败响应的结构化报告
+  issueLoading: false,
 };
 
 async function loadReviews() {
@@ -1694,14 +1699,20 @@ function renderReviewList() {
   }
   for (const s of reviewUI.sessions) {
     const li = hEl('li', { class: 'review-item' });
+    const issueTag = s.issuance
+      ? `<span class="tag issuance">已签发 🔒</span>` : '';
     li.innerHTML = `
       <div class="version-head"><span>${esc(s.title)}</span>
-        <span class="tag ${s.status === 'open' ? 'commit' : 'current'}">${s.status === 'open' ? '开放中' : '已封榜'}</span></div>
+        <span class="tag-row">
+          ${issueTag}
+          <span class="tag ${s.status === 'open' ? 'commit' : 'current'}">${s.status === 'open' ? '开放中' : '已封榜'}</span>
+        </span></div>
       <div class="version-meta">
         <span>绑定 v${s.version_id}</span>
         <span>候选 ${s.candidate_count}</span>
         <span>已提交 ${s.submitted_count}/${s.reviewer_count}</span>
         <span>最低 ${s.min_votes} 票</span>
+        ${s.issuance ? `<span class="issuance-meta">签发 #${s.issuance.id} · ${esc((s.issuance.issued_at || '').replace('T', ' ').replace('Z', ' UTC'))}</span>` : ''}
       </div>`;
     li.addEventListener('click', () => openReview(s.id));
     ul.appendChild(li);
@@ -1796,6 +1807,9 @@ async function openReview(id) {
     reviewUI.detail = await api(`/api/reviews/${id}`);
     reviewUI.tab = reviewUI.detail.status === 'closed' ? 'ranks' : 'vote';
     reviewUI.ranking = [];
+    reviewUI.issueSel = null;
+    reviewUI.issueNote = '';
+    reviewUI.issueReport = null;
     $('reviewModal').hidden = false;
     renderReviewModal();
   } catch (err) {
@@ -1807,6 +1821,9 @@ function closeReviewModal() {
   $('reviewModal').hidden = true;
   reviewUI.detail = null;
   reviewUI.ranking = [];
+  reviewUI.issueSel = null;
+  reviewUI.issueNote = '';
+  reviewUI.issueReport = null;
 }
 
 async function reloadReviewDetail() {
@@ -1830,7 +1847,8 @@ function renderReviewModal() {
   const body = $('reviewBody');
   if (reviewUI.tab === 'vote') renderReviewVoteTab(body, d);
   else if (reviewUI.tab === 'ranks') renderReviewRanksTab(body, d);
-  else renderReviewMatrixTab(body, d);
+  else if (reviewUI.tab === 'matrix') renderReviewMatrixTab(body, d);
+  else renderReviewIssuanceTab(body, d);
 }
 
 function renderReviewVoteTab(body, d) {
@@ -2036,6 +2054,242 @@ function renderReviewMatrixTab(body, d) {
         : `<b>${esc(titles[from] || from)} → ${esc(titles[to] || to)}</b>：无最强路径（p=0，该方向不构成胜出）。`;
     });
   });
+}
+
+// ---------- 根因结论签发 ----------
+//
+// 从已封榜盲评场提交一个不可变版本的最终根因集合与签发说明：服务端在同一个 SQLite
+// 写事务中重新读取评审绑定版本、Schulze 名次、证据审查与有效时间窗，逐项校验
+// （恰好覆盖最高并列名次、候选间无 causes 祖先关系、证据状态不得为 insufficient /
+// refuted）；任一失败逐项拒绝。通过后写入只追加的签发记录（规范化 payload + SHA-256），
+// 同场唯一，后续图版本变化不影响记录；不改写图、评审票或历史快照。
+
+const ISSUE_CHECK_LABELS = {
+  session_closed: '评审场已封榜',
+  not_already_issued: '同场尚未签发',
+  set_well_formed: '集合合法（非空 / 不重复 / 均为候选）',
+  covers_top_rank_exactly: '恰好覆盖最高并列名次',
+  no_candidate_ancestor_relation: '候选间无 causes 祖先关系',
+  evidence_admissible: '证据状态均可采信（非不足 / 反驳）',
+  time_window_ok: '有效时间窗无冲突',
+};
+const ISSUE_EV_CLASS = {
+  supported: 'ok', disputed: 'warn', refuted: 'bad', insufficient: 'bad',
+};
+const ISSUE_EV_TEXT = {
+  supported: '已支持', disputed: '存在争议', refuted: '已反驳', insufficient: '证据不足',
+};
+
+function issueSelectedIds(d) {
+  // 首次进入：默认勾选最高并列名次
+  if (reviewUI.issueSel === null) {
+    const top = d.result?.ranks?.[0]?.node_ids || [];
+    reviewUI.issueSel = new Set(top);
+  }
+  return reviewUI.issueSel;
+}
+
+function renderReviewIssuanceTab(body, d) {
+  const issued = d.issuance;
+  if (issued) {
+    // 评审场详情只挂接签发摘要；完整 payload（候选状态快照等）按需拉取
+    if (issued.payload) { renderIssuedRecord(body, d, issued); return; }
+    body.innerHTML = '<p class="muted small">正在加载签发记录…</p>';
+    api(`/api/reviews/${d.id}/issuance`).then((full) => {
+      reviewUI.detail.issuance = full;
+      if (reviewUI.tab === 'issuance' && reviewUI.detail?.id === d.id) {
+        renderIssuedRecord(body, d, full);
+      }
+    }).catch((err) => {
+      body.innerHTML = `<div class="pkg-verdict fail">签发记录加载失败：${esc(err.message)}</div>`;
+    });
+    return;
+  }
+  if (d.status !== 'closed' || !d.result) {
+    body.innerHTML = `
+      <div class="pkg-verdict fail">评审场尚未封榜：只有封榜并冻结选票后，才能签发不可变的最终根因集合。</div>
+      <p class="muted small">请先在「投票」页完成投票并封榜；封榜后本页将按 Schulze 最高并列名次
+        重新校验覆盖性、候选间因果祖先关系与每个候选的证据状态。</p>`;
+    return;
+  }
+  const sel = issueSelectedIds(d);
+  const topIds = new Set(d.result.ranks[0].node_ids);
+  const rows = d.candidates.map((c) => {
+    const checked = sel.has(c.node_id) ? 'checked' : '';
+    return `
+      <tr class="${topIds.has(c.node_id) ? 'is-top' : ''}">
+        <td><label class="issue-pick"><input type="checkbox" value="${esc(c.node_id)}" ${checked}/></label></td>
+        <td>${c.rank ? `第 ${c.rank} 名${topIds.has(c.node_id) ? ' ★' : ''}` : '—'}</td>
+        <td title="${esc(c.node_id)}">${esc(c.title)}</td>
+      </tr>`;
+  }).join('');
+  body.innerHTML = `
+    <p class="muted small">
+      从本场<b>已冻结</b>的盲评结果签发<b>不可变</b>根因结论。提交后服务端会在同一个写事务中
+      重新读取绑定版本 v${d.version_id} 的图、Schulze 名次、证据审查与有效时间窗并逐项校验；
+      通过即写入只追加记录（规范化 payload + SHA-256），<b>同场不可重复签发</b>，
+      后续图版本变化不影响记录，且不会改写图、选票或历史快照。
+    </p>
+    <div class="detail-row">
+      <label>最终根因集合（须恰好覆盖最高并列名次：${d.result.ranks[0].node_ids
+        .map((id) => `「${esc(d.candidates.find((c) => c.node_id === id)?.title || id)}」`).join('、')}）</label>
+      <div class="matrix-wrap"><table class="issue-table">
+        <thead><tr><th style="width:36px">选</th><th style="width:90px">Schulze 名次</th><th>候选事件</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+    </div>
+    <div class="detail-row">
+      <label>签发说明（随记录不可变保存）</label>
+      <textarea id="issueNote" rows="3" maxlength="4000"
+        placeholder="如：经 3 名评审人盲评封榜，确认空指针异常为本次支付链路中断的最终根因……">${esc(reviewUI.issueNote)}</textarea>
+    </div>
+    <div class="sandbox-actions">
+      <button class="btn btn-small" id="btnIssueValidate">重新校验</button>
+      <button class="btn btn-small btn-primary" id="btnIssueSubmit">签发不可变根因结论</button>
+    </div>
+    <div id="issueReport"><p class="muted small">点击「重新校验」可在不写库的情况下查看逐项检查结果。</p></div>`;
+
+  body.querySelectorAll('.issue-pick input').forEach((cb) => {
+    cb.addEventListener('change', () => {
+      if (cb.checked) sel.add(cb.value); else sel.delete(cb.value);
+    });
+  });
+  $('issueNote').addEventListener('input', (ev) => { reviewUI.issueNote = ev.target.value; });
+  $('btnIssueValidate').addEventListener('click', () => { void runIssueValidate(d); });
+  $('btnIssueSubmit').addEventListener('click', () => { void submitIssuance(d); });
+  // 进入页签自动预检一次（默认勾选最高并列名次）
+  if (!reviewUI.issueReport) void runIssueValidate(d);
+  else renderIssueReport($('issueReport'), reviewUI.issueReport, d);
+}
+
+async function runIssueValidate(d, nodeIds) {
+  const ids = nodeIds || [...issueSelectedIds(d)].sort();
+  const box = $('issueReport');
+  if (box) box.innerHTML = '<p class="muted small">校验中…</p>';
+  try {
+    const rep = await api(`/api/reviews/${d.id}/issuance/validate`, {
+      method: 'POST',
+      body: JSON.stringify({ node_ids: ids, note: reviewUI.issueNote || null }),
+    });
+    reviewUI.issueReport = rep;
+    if (reviewUI.tab === 'issuance' && reviewUI.detail?.id === d.id) {
+      renderIssueReport($('issueReport'), rep, d);
+    }
+    return rep;
+  } catch (err) {
+    if (box) box.innerHTML = `<div class="pkg-verdict fail">校验请求失败：${esc(err.message)}</div>`;
+    return null;
+  }
+}
+
+function renderIssueReport(box, rep, d) {
+  if (!box) return;
+  const checkRows = Object.entries(ISSUE_CHECK_LABELS).map(([key, label]) => {
+    const v = rep.checks?.[key];
+    if (v === null || v === undefined) return '';
+    const cls = v ? 'ok' : 'bad';
+    const icon = v ? '✔' : '✘';
+    return `<span class="pkg-check ${cls}">${icon} ${esc(label)}</span>`;
+  }).join('');
+  const candRows = (rep.candidates || []).map((c) => {
+    const picked = c.in_submitted_set ? '<b>在集合内</b>' : '';
+    const evCls = ISSUE_EV_CLASS[c.evidence_status] || '';
+    const tw = c.time_window;
+    const twText = tw
+      ? `${fmtTimeShort(tw.effective_lower)} ~ ${fmtTimeShort(tw.effective_upper)}`
+      : '—';
+    return `<tr class="${c.in_submitted_set ? 'picked' : ''} ${c.is_top_rank ? 'is-top' : ''}">
+      <td>${c.rank ? `第 ${c.rank} 名${c.is_top_rank ? ' ★' : ''}` : '—'}</td>
+      <td title="${esc(c.node_id)}">${esc(c.title)}</td>
+      <td><span class="status-chip ${c.evidence_status}">${esc(c.evidence_status_label)}</span>
+        <span class="muted tiny">S=${c.support_score} R=${c.refute_score}</span></td>
+      <td class="muted tiny">${esc(twText)}</td>
+      <td class="muted tiny">${picked}</td>
+    </tr>`;
+  }).join('');
+  const violationsHtml = rep.violations?.length ? `
+    <div class="pkg-verdict fail">校验未通过（${rep.violations.length} 项），签发将被拒绝：</div>
+    <ul class="issue-violations">
+      ${rep.violations.map((v) => `<li><code>${esc(v.code)}</code> · ${esc(v.message)}</li>`).join('')}
+    </ul>` : `
+    <div class="pkg-verdict ok">✔ 全部检查通过，可以签发（写入后不可修改、同场不可重复签发）。</div>`;
+  box.innerHTML = `
+    <div class="pkg-checks">${checkRows}</div>
+    ${violationsHtml}
+    <div class="window-title" style="margin-top:8px">候选逐项明细（按绑定版本重算证据审查与有效时间窗）</div>
+    <div class="matrix-wrap"><table class="issue-table detail">
+      <thead><tr><th>名次</th><th>候选</th><th>证据状态</th><th>有效时间窗(UTC)</th><th>提交集合</th></tr></thead>
+      <tbody>${candRows}</tbody>
+    </table></div>
+    <p class="muted tiny">★ 最高并列名次；争议（disputed）允许签发，证据不足（insufficient）与已反驳（refuted）拒绝。</p>`;
+}
+
+async function submitIssuance(d) {
+  const ids = [...issueSelectedIds(d)].sort();
+  const note = $('issueNote').value.trim();
+  if (!ids.length) { flashBanner('最终根因集合不能为空。'); return; }
+  if (!note) { flashBanner('请填写签发说明。'); return; }
+  if (!confirm('确认签发？签发记录不可修改、不可删除，且同场不可重复签发。')) return;
+  try {
+    await api(`/api/reviews/${d.id}/issuance`, {
+      method: 'POST',
+      body: JSON.stringify({ node_ids: ids, note }),
+    });
+    toast('根因结论已签发（不可变记录）');
+    await reloadReviewDetail();
+    reviewUI.tab = 'issuance';
+    renderReviewModal();
+    loadReviews();
+  } catch (err) {
+    // 400：逐项校验失败，服务端随响应返回 report；409：同场已签发
+    if (err.payload?.report) {
+      reviewUI.issueReport = err.payload.report;
+      renderIssueReport($('issueReport'), err.payload.report, d);
+    }
+    flashBanner('签发被拒绝：' + err.message);
+    if (err.payload?.code === 'already_issued') {
+      await reloadReviewDetail();
+      renderReviewModal();
+    }
+  }
+}
+
+function renderIssuedRecord(body, d, issued) {
+  const rootChips = (issued.root_cause_titles || []).map((t) =>
+    `<span class="rank-node">${esc(t)}</span>`).join(' ');
+  const rows = issued.payload?.candidates?.map((c) => `
+    <tr class="${(issued.root_cause_node_ids || []).includes(c.node_id) ? 'picked' : ''}">
+      <td>${c.rank ? `第 ${c.rank} 名` : '—'}</td>
+      <td title="${esc(c.node_id)}">${esc(c.title)}</td>
+      <td><span class="status-chip ${c.evidence_status}">${esc(ISSUE_EV_TEXT[c.evidence_status] || c.evidence_status)}</span></td>
+    </tr>`).join('') || '';
+  body.innerHTML = `
+    <div class="pkg-verdict ok">
+      🔒 根因结论已于 ${esc(fmtTime(issued.issued_at))} 签发（记录 #${issued.id}）。
+      记录只追加、不可修改 / 删除，同场唯一；关联评审场 #${issued.session_id} 与不可变版本 v${issued.version_id}，
+      后续图版本变化不影响本记录。
+    </div>
+    <div class="window-title">最终根因集合</div>
+    <div class="rv-chips">${rootChips}</div>
+    <div class="detail-row" style="margin-top:8px">
+      <label>签发说明</label>
+      <div class="window-box">${esc(issued.note)}</div>
+    </div>
+    <div class="detail-row">
+      <label>SHA-256 摘要（对规范化结论 payload 的紧凑 UTF-8 JSON 计算）</label>
+      <div class="mono tiny">${esc(issued.digest_algorithm)}：${esc(issued.digest)}</div>
+    </div>
+    <div class="sandbox-actions">
+      <a class="btn btn-small" href="/api/reviews/${d.id}/issuance/download"
+         download="root-cause-issuance-r${d.id}-v${issued.version_id}-${esc(issued.digest.slice(0, 8))}.json">下载签发文件（规范化 JSON）</a>
+    </div>
+    ${rows ? `
+      <div class="window-title" style="margin-top:6px">签发时各候选状态快照（取自绑定版本 v${issued.version_id}）</div>
+      <div class="matrix-wrap"><table class="issue-table detail">
+        <thead><tr><th>名次</th><th>候选</th><th>证据状态</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>` : ''}
+    <p class="muted tiny">本次签发未改写因果图、评审选票或任何历史快照。</p>`;
 }
 
 // ---------- 变更提案：保存 / 预览 / 三方比较裁决合并 ----------

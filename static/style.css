@@ -558,3 +558,35 @@ textarea { resize: vertical; width: 100%; }
 .cf-val { color: var(--text-dim); font-size: 10px; word-break: break-all; }
 .merge-footer { border-top: 1px solid var(--border); margin-top: 10px; padding-top: 10px; }
 #mergeMessage { width: 100%; margin-bottom: 6px; }
+
+/* ---------- 根因结论签发 ---------- */
+.tag.issuance {
+  background: rgba(251, 191, 36, 0.16); color: var(--evidence);
+  border: 1px solid rgba(251, 191, 36, 0.5);
+}
+.tag-row { display: inline-flex; gap: 4px; align-items: center; }
+.issuance-meta { color: var(--evidence); }
+
+.issue-table { border-collapse: collapse; font-size: 11px; width: 100%; }
+.issue-table th, .issue-table td {
+  border: 1px solid var(--border); padding: 4px 8px; text-align: left;
+  vertical-align: middle;
+}
+.issue-table th { color: var(--text-dim); font-weight: 600; background: var(--bg); }
+.issue-table tr.is-top td { background: rgba(56, 189, 248, 0.07); }
+.issue-table tr.picked td { background: rgba(74, 222, 128, 0.06); }
+.issue-table tr.picked.is-top td { background: rgba(74, 222, 128, 0.11); }
+.issue-pick { display: flex; justify-content: center; cursor: pointer; }
+.issue-pick input { margin: 0; accent-color: var(--evidence); }
+.issue-table .status-chip.insufficient {
+  background: var(--bg-panel-2); color: var(--text-dim); border-color: var(--border);
+}
+.issue-violations {
+  margin: 6px 0 4px; padding-left: 18px; font-size: 11px; line-height: 1.8; color: #fecaca;
+}
+.issue-violations code {
+  color: #fca5a5; background: rgba(248, 113, 113, 0.1);
+  border-radius: 4px; padding: 0 4px; font-size: 10px;
+}
+#issueNote { margin-top: 2px; }
+.pkg-verdict.ok code, .pkg-verdict.fail code { font-size: 10px; }

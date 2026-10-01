@@ -11,10 +11,12 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from app import conclusion, database, graph, proposals, review
+from app import conclusion, database, graph, issuance, proposals, review
 from app.schemas import (
     CommitRequest,
     CounterfactualRequest,
+    IssuanceIssueRequest,
+    IssuanceValidateRequest,
     MergeCommitRequest,
     MergePreviewRequest,
     ProposalSaveRequest,
@@ -71,6 +73,17 @@ async def proposal_error_handler(request: Request, exc: proposals.ProposalError)
     return JSONResponse(
         status_code=exc.status_code,
         content={"detail": exc.message, "code": exc.code},
+    )
+
+
+@app.exception_handler(issuance.IssuanceError)
+async def issuance_error_handler(request: Request, exc: issuance.IssuanceError) -> JSONResponse:
+    # 重复签发等状态冲突为 409；校验失败为 400，逐项原因随 violations / report 返回
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.message, "code": exc.code,
+                 "violations": exc.report["violations"] if exc.report else None,
+                 "report": exc.report},
     )
 
 
@@ -227,7 +240,11 @@ async def verify_conclusion(request: Request):
 
 @app.get("/api/reviews")
 def list_reviews(conn: sqlite3.Connection = Depends(get_conn)):
-    return {"sessions": review.list_sessions(conn)}
+    sessions = review.list_sessions(conn)
+    issued_map = issuance.list_sessions_issued(conn)
+    for s in sessions:
+        s["issuance"] = issued_map.get(s["id"])
+    return {"sessions": sessions}
 
 
 @app.post("/api/reviews", status_code=201)
@@ -244,8 +261,13 @@ def create_review(body: ReviewCreateRequest, conn: sqlite3.Connection = Depends(
 
 @app.get("/api/reviews/{session_id}")
 def get_review(session_id: int, conn: sqlite3.Connection = Depends(get_conn)):
-    """评审场详情。封榜前只含已提交名单与数量（不泄露任何排序）；封榜后附 Schulze 计票结果。"""
-    return review.get_session(conn, session_id)
+    """评审场详情。封榜前只含已提交名单与数量（不泄露任何排序）；封榜后附 Schulze 计票结果。
+    若该场已签发根因结论，附不可变签发记录摘要（完整 payload 走签发专用接口）。"""
+    detail = review.get_session(conn, session_id)
+    irow = conn.execute(
+        "SELECT * FROM root_cause_issuances WHERE session_id = ?", (session_id,)).fetchone()
+    detail["issuance"] = issuance.issuance_brief(irow) if irow is not None else None
+    return detail
 
 
 @app.post("/api/reviews/{session_id}/ballots")
@@ -260,6 +282,47 @@ def close_review(session_id: int, body: ReviewCloseRequest,
                  conn: sqlite3.Connection = Depends(get_conn)):
     """封榜：写事务内校验 session_revision 与最低票数并冻结选票；过期 / 重复封榜返回 409。"""
     return review.close_session(conn, session_id, expected_revision=body.expected_revision)
+
+
+# ---------- 根因结论签发（已封榜盲评场 → 不可变签发记录；只追加，不改写图 / 票 / 快照） ----------
+
+@app.post("/api/reviews/{session_id}/issuance/validate")
+def validate_issuance(session_id: int, body: IssuanceValidateRequest | None = None,
+                      conn: sqlite3.Connection = Depends(get_conn)):
+    """只读预检：在同一口径下重新读取绑定版本、Schulze 名次、证据审查与有效时间窗，
+    返回各签发条件是否通过与逐项失败原因（不写库、不生成记录）。"""
+    node_ids = body.node_ids if body is not None else None
+    note = body.note if body is not None else None
+    return issuance.evaluate(conn, session_id, node_ids, note=note, for_issue=False)
+
+
+@app.post("/api/reviews/{session_id}/issuance")
+def issue_root_cause_issuance(session_id: int, body: IssuanceIssueRequest,
+                              conn: sqlite3.Connection = Depends(get_conn)):
+    """签发最终根因集合：单个 SQLite 写事务内重读绑定版本 / Schulze 名次 / 证据审查 /
+    有效时间窗并逐项校验（恰好覆盖最高并列名次、候选间无 causes 祖先关系、
+    证据状态不得为 insufficient 或 refuted）；任一失败逐项拒绝。通过后写入不可修改
+    记录（规范化 payload + SHA-256），同场唯一，后续图版本变化不影响记录。"""
+    return issuance.issue_issuance(conn, session_id, node_ids=body.node_ids, note=body.note)
+
+
+@app.get("/api/reviews/{session_id}/issuance")
+def get_root_cause_issuance(session_id: int, conn: sqlite3.Connection = Depends(get_conn)):
+    """读取签发记录（含规范化结论 payload 与摘要）；不存在返回 404。"""
+    return issuance.get_issuance(conn, session_id)
+
+
+@app.get("/api/reviews/{session_id}/issuance/download")
+def download_root_cause_issuance(session_id: int, conn: sqlite3.Connection = Depends(get_conn)):
+    """下载签发文件：含 digest 的规范化 JSON（键按字典序、紧凑/可读排版均可复算摘要）。"""
+    rec = issuance.get_issuance(conn, session_id)
+    content = conclusion.package_file_bytes(rec["package"])
+    filename = f"root-cause-issuance-r{session_id}-v{rec['version_id']}-{rec['digest'][:8]}.json"
+    return Response(
+        content=content,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ---------- 提交一组修改（事务：校验整张图，任一失败全部拒绝） ----------

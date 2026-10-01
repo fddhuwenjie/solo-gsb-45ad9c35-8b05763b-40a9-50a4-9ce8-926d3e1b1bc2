@@ -184,6 +184,20 @@ class ReviewCloseRequest(BaseModel):
     expected_revision: int = Field(ge=1)
 
 
+# ---------- 根因结论签发（从已封榜盲评场签发不可变最终根因集合） ----------
+
+class IssuanceIssueRequest(BaseModel):
+    # 用户提交的最终根因集合：服务端在写事务内重新校验其恰好覆盖最高并列名次
+    node_ids: list[str] = Field(min_length=1, max_length=20)
+    note: str = Field(min_length=1, max_length=4000)  # 签发说明（必填）
+
+
+class IssuanceValidateRequest(BaseModel):
+    # 预检（只读）：不传 / 传 null 时默认按最高并列名次校验；note 可留空
+    node_ids: Optional[list[str]] = Field(default=None, max_length=20)
+    note: Optional[str] = Field(default=None, max_length=4000)
+
+
 # ---------- 通用错误 ----------
 
 class ErrorResponse(BaseModel):
