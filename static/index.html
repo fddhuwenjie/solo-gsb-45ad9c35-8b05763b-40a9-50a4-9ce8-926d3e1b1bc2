@@ -159,7 +159,10 @@
         <p class="muted small">
           绑定某个<b>不可变版本</b>，选取 3~20 个事件作为候选，登记唯一评审人并设置最低票数。
           封榜前只公开已提交名单与数量，不泄露任何排序；封榜（校验 session_revision）后按
-          <b>Schulze 法</b>计票并公开全部选票。<b>不改写</b>因果图、版本或结论包。
+          <b>Schulze 法</b>计票并公开全部选票。封榜后可在评审室「根因签发」页签发
+          <b>不可变版本的最终根因集合</b>（恰好覆盖最高并列名次、互不为 causes 祖先、
+          证据状态均合格），通过后保存规范化结论 payload 与 SHA-256 摘要，同场不可重复签发。
+          <b>不改写</b>因果图、版本、评审票或历史快照。
         </p>
         <div class="sandbox-actions">
           <button class="btn btn-small" id="btnReviewNew">新建评审场</button>
@@ -229,6 +232,7 @@
         <button class="seg-btn active" data-rtab="vote">投票</button>
         <button class="seg-btn" data-rtab="ranks">名次</button>
         <button class="seg-btn" data-rtab="matrix">两两矩阵</button>
+        <button class="seg-btn" data-rtab="issue">根因签发</button>
       </div>
       <div class="review-body" id="reviewBody"></div>
     </div>

@@ -105,6 +105,20 @@ CREATE TABLE IF NOT EXISTS proposals (
 
 CREATE INDEX IF NOT EXISTS idx_proposals_base ON proposals(base_version_id);
 CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status);
+
+-- 根因结论签发：从已封榜盲评场签发一个不可变版本的最终根因集合。
+-- 记录只增不改：应用层不提供任何 UPDATE / DELETE 接口；session_id 唯一，同场不可重复签发。
+-- 版本快照与评审绑定均不可变，后续图版本变化不影响本表记录。
+CREATE TABLE IF NOT EXISTS conclusion_issuances (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      INTEGER NOT NULL UNIQUE REFERENCES review_sessions(id),
+    version_id      INTEGER NOT NULL REFERENCES versions(id),  -- 评审场绑定版本（签发时在写事务内重读）
+    note            TEXT NOT NULL,                            -- 签发说明
+    root_cause_ids  TEXT NOT NULL CHECK (json_valid(root_cause_ids)),  -- JSON 数组：最终根因节点 id（按 id 排序）
+    payload_json    TEXT NOT NULL CHECK (json_valid(payload_json)),    -- 规范化结论 payload（紧凑、键有序）
+    digest_sha256   TEXT NOT NULL,                            -- SHA-256(canonical compact JSON(payload))
+    created_at      TEXT NOT NULL                             -- 签发时间 UTC（与 payload.issued_at 一致）
+);
 """
 
 # (id, type, title, desc, x, y, earliest_time_utc, latest_time_utc, reliability, source_group, trigger_mode)

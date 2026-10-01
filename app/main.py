@@ -11,10 +11,11 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from app import conclusion, database, graph, proposals, review
+from app import conclusion, database, graph, issuance, proposals, review
 from app.schemas import (
     CommitRequest,
     CounterfactualRequest,
+    IssuanceRequest,
     MergeCommitRequest,
     MergePreviewRequest,
     ProposalSaveRequest,
@@ -72,6 +73,15 @@ async def proposal_error_handler(request: Request, exc: proposals.ProposalError)
         status_code=exc.status_code,
         content={"detail": exc.message, "code": exc.code},
     )
+
+
+@app.exception_handler(issuance.IssuanceError)
+async def issuance_error_handler(request: Request, exc: issuance.IssuanceError) -> JSONResponse:
+    # 已签发 / 未封榜等状态冲突为 409；业务条件不满足为 400 并附逐项校验结果
+    content: dict[str, Any] = {"detail": exc.message, "code": exc.code}
+    if exc.validation is not None:
+        content["validation"] = exc.validation
+    return JSONResponse(status_code=exc.status_code, content=content)
 
 
 # ---------- 序列化 ----------
@@ -260,6 +270,43 @@ def close_review(session_id: int, body: ReviewCloseRequest,
                  conn: sqlite3.Connection = Depends(get_conn)):
     """封榜：写事务内校验 session_revision 与最低票数并冻结选票；过期 / 重复封榜返回 409。"""
     return review.close_session(conn, session_id, expected_revision=body.expected_revision)
+
+
+# ---------- 根因结论签发（只写 conclusion_issuances；不改写图 / 评审票 / 历史快照） ----------
+
+@app.post("/api/reviews/{session_id}/issuance/validate")
+def validate_issuance(session_id: int, body: IssuanceRequest,
+                      conn: sqlite3.Connection = Depends(get_conn)):
+    """只读预校验：重读绑定版本、Schulze 名次、证据审查与有效时间窗，
+    返回逐项校验结果与每个候选的名次 / 证据状态 / 时间窗。不写任何表；正式签发时
+    会在写事务内以同一口径重新计算，不沿用本结果。"""
+    return issuance.build_validation(conn, session_id, body.root_cause_ids, body.note)
+
+
+@app.post("/api/reviews/{session_id}/issuance", status_code=201)
+def issue_conclusion(session_id: int, body: IssuanceRequest,
+                     conn: sqlite3.Connection = Depends(get_conn)):
+    """签发：同一 SQLite 写事务内重读全部依据并逐项校验，全部通过才写入不可修改的签发记录；
+    任一条件不满足返回 400，响应 validation 字段逐项说明原因。"""
+    return issuance.issue(conn, session_id, body.root_cause_ids, body.note)
+
+
+@app.get("/api/reviews/{session_id}/issuance")
+def get_session_issuance(session_id: int, conn: sqlite3.Connection = Depends(get_conn)):
+    record = issuance.get_issuance_by_session(conn, session_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"评审场 {session_id} 尚无签发记录")
+    return record
+
+
+@app.get("/api/issuances")
+def list_issuances(conn: sqlite3.Connection = Depends(get_conn)):
+    return issuance.list_issuances(conn)
+
+
+@app.get("/api/issuances/{issuance_id}")
+def get_issuance(issuance_id: int, conn: sqlite3.Connection = Depends(get_conn)):
+    return issuance.get_issuance(conn, issuance_id)
 
 
 # ---------- 提交一组修改（事务：校验整张图，任一失败全部拒绝） ----------

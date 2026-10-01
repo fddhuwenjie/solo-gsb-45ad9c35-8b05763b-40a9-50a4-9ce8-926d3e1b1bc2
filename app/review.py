@@ -263,6 +263,24 @@ def close_session(
 
 # ---------- 查询 ----------
 
+def _issuance_summary(conn: sqlite3.Connection, session_id: int) -> dict[str, Any] | None:
+    """签发记录摘要（内联查询，避免 review ↔ issuance 循环导入）；未签发返回 None。"""
+    row = conn.execute(
+        "SELECT id, version_id, root_cause_ids, digest_sha256, created_at "
+        "FROM conclusion_issuances WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "version_id": row["version_id"],
+        "root_cause_ids": json.loads(row["root_cause_ids"]),
+        "issued_at": row["created_at"],
+        "digest_sha256": row["digest_sha256"],
+    }
+
+
 def get_session(conn: sqlite3.Connection, session_id: int) -> dict[str, Any]:
     row = _row_or_404(conn, session_id)
     candidates = _candidate_ids(conn, session_id)
@@ -285,6 +303,7 @@ def get_session(conn: sqlite3.Connection, session_id: int) -> dict[str, Any]:
         "submitted": submitted,
         "submitted_count": len(submitted),
         "result": None,
+        "issuance": _issuance_summary(conn, session_id),
     }
     if row["status"] == "closed":
         rankings = [json.loads(b["ranking"]) for b in ballots]
@@ -304,7 +323,8 @@ def list_sessions(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         "SELECT s.*, "
         "  (SELECT COUNT(*) FROM review_candidates c WHERE c.session_id = s.id) AS candidate_count, "
         "  (SELECT COUNT(*) FROM review_reviewers r WHERE r.session_id = s.id) AS reviewer_count, "
-        "  (SELECT COUNT(*) FROM review_ballots b WHERE b.session_id = s.id) AS submitted_count "
+        "  (SELECT COUNT(*) FROM review_ballots b WHERE b.session_id = s.id) AS submitted_count, "
+        "  (SELECT COUNT(*) FROM conclusion_issuances i WHERE i.session_id = s.id) AS issued_count "
         "FROM review_sessions s ORDER BY s.id DESC",
     ).fetchall()
     return [
@@ -320,6 +340,7 @@ def list_sessions(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             "candidate_count": r["candidate_count"],
             "reviewer_count": r["reviewer_count"],
             "submitted_count": r["submitted_count"],
+            "issued": bool(r["issued_count"]),
         }
         for r in rows
     ]

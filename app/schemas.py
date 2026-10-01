@@ -184,6 +184,16 @@ class ReviewCloseRequest(BaseModel):
     expected_revision: int = Field(ge=1)
 
 
+# ---------- 根因结论签发 ----------
+
+class IssuanceRequest(BaseModel):
+    # 最终根因集合（候选 id）；恰好覆盖最高并列名次、互不为 causes 祖先、
+    # 证据状态均合格由服务端在写事务内重新校验
+    root_cause_ids: list[str] = Field(min_length=1, max_length=20)
+    # 签发说明（非空由服务层校验，最长 2000 字符）
+    note: str = Field(min_length=1, max_length=2000)
+
+
 # ---------- 通用错误 ----------
 
 class ErrorResponse(BaseModel):

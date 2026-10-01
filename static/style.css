@@ -558,3 +558,33 @@ textarea { resize: vertical; width: 100%; }
 .cf-val { color: var(--text-dim); font-size: 10px; word-break: break-all; }
 .merge-footer { border-top: 1px solid var(--border); margin-top: 10px; padding-top: 10px; }
 #mergeMessage { width: 100%; margin-bottom: 6px; }
+
+/* ---------- 根因结论签发 ---------- */
+.tag.is-issued { background: rgba(192,132,252,.18); color: #c084fc; border: 1px solid rgba(192,132,252,.4); margin-left: 4px; }
+.issue-rank-group { padding: 6px 0; border-top: 1px solid var(--border); }
+.issue-cands { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+.issue-cand {
+  display: flex; align-items: center; gap: 8px; padding: 4px 8px;
+  border-radius: 6px; background: var(--bg); border: 1px solid var(--border);
+}
+.issue-cand.is-top { border-color: rgba(56,189,248,.45); background: rgba(56,189,248,.06); }
+.issue-cand .status-chip { margin-left: auto; font-size: 10px; padding: 1px 8px; }
+.issue-cand .status-chip.bad { background: rgba(248,113,113,.15); color: #f87171; border-color: rgba(248,113,113,.5); }
+.issue-checks { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.issue-check { font-size: 12px; font-weight: 600; }
+.issue-check.pass { color: var(--ok); }
+.issue-check.fail { color: #f87171; }
+.issue-check.pending { color: var(--text-dim); }
+.issue-reasons { margin: 4px 0 0; padding-left: 18px; font-size: 11px; line-height: 1.7; color: var(--text); }
+.issue-reasons code {
+  font-size: 10px; color: var(--text-dim); background: var(--bg-panel-2);
+  padding: 0 5px; border-radius: 8px; margin-left: 4px;
+}
+.issue-table { margin: 6px 0; }
+.issue-table th, .issue-table td { padding: 5px 8px; font-size: 11px; }
+.issue-digest { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; }
+.issue-digest-val {
+  display: block; margin: 4px 0; font-size: 10px; line-height: 1.5;
+  word-break: break-all; color: var(--accent); background: var(--bg);
+  border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px;
+}

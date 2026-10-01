@@ -12,6 +12,12 @@ still_active，并给出目标的递归依据树。**可复算复盘结论包**�
 每位评审人提交覆盖全部候选的严格排序，封榜前只公开已提交名单与数量、不泄露任何排序，
 封榜（写事务内校验 `session_revision` 与最低票数）后按 **Schulze 法**计算两两偏好与最强路径，
 逐层生成并列名次并公开全部选票。
+**根因结论签发**：从已封榜盲评场提交一个不可变版本的最终根因集合与签发说明，服务端在
+**同一个 SQLite 写事务**中重新读取评审绑定版本、Schulze 名次、证据审查与有效时间窗，
+要求集合**恰好覆盖最高并列名次**、候选之间**不存在 causes 祖先关系**、每个候选证据状态
+**不得为 insufficient 或 refuted**；任一条件不满足都拒绝并逐项说明原因。通过后写入
+**不可修改的签发记录**（规范化结论 payload 与 SHA-256 摘要，关联评审场与版本），
+同场不可重复签发，后续图版本变化不影响记录。
 **变更提案合并**：可把一组未提交修改保存为**绑定 `base_version` 的提案**，保存时只在对应基线上
 复用整图校验、**不生成版本**；选择两份同基线且未合并的提案做**基线 / A / B 三方比较**，
 单侧修改与双方相同修改直接采纳，同字段改成不同值、删除与修改相遇列为冲突逐项裁决，
@@ -93,6 +99,28 @@ still_active，并给出目标的递归依据树。**可复算复盘结论包**�
   - **计票**：按 **Schulze 法**计算两两偏好 `d` 与最强路径 `p`，按胜出关系**逐层生成并列名次**；
     候选 ID 仅用于稳定展示，**不打断算法并列**；任意一对胜负都返回**确定性的最强路径见证**
   - 封榜后公开全部选票，名次 / 矩阵 / 见证均可在前端「评审室」弹窗中查看
+- **根因结论签发（Root-Cause Conclusion Issuance）**
+  - 从**已封榜**评审场提交最终根因集合（候选 id）与**签发说明**；未封榜 / 同场已签发返回 **409**
+  - 服务端在**同一个 SQLite 写事务**（`BEGIN IMMEDIATE`）内**重新读取**（不信任客户端预判）：
+    评审绑定的不可变版本快照、按冻结选票重算的 **Schulze 名次**、按版本数据重算的
+    **证据强度审查**与**有效时间窗**
+  - 三项业务条件**逐项校验**，任一不满足整批拒绝（400，响应 `validation.checks[]` 逐项给出原因）：
+    - **恰好覆盖最高并列名次**：不得缺少最高并列层候选（`missing_top_rank`）、
+      不得夹带非最高名次候选（`non_top_rank_included`）或非本场候选（`not_candidate`）、不得重复
+    - **候选之间不存在 causes 祖先关系**：在绑定版本的「事件 + causes」子图上求传递闭包，
+      任一方向可达即拒绝（`causes_ancestor`），并给出确定性的因果见证链
+    - **证据状态合格**：每个候选的证据审查状态不得为 `insufficient` 或 `refuted`
+      （`supported` / `disputed` 允许），逐项给出 S/R 分数
+  - 全部通过后写入一条**此后不可修改**的 `conclusion_issuances` 记录：保存
+    **规范化结论 payload**（紧凑、键按字典序）与其 **SHA-256** 摘要，关联评审场与绑定版本；
+    payload 冻结 Schulze 名次、每个根因的证据审查全量结果与有效时间窗、版本元数据与签发说明
+  - **同场不可重复签发**（`session_id UNIQUE` + 事务内复查，409 `already_issued`）；
+    记录只增不改，**后续图版本变化（提交 / 回滚 / 合并）不影响已签发记录**
+  - `POST .../issuance/validate` 为**只读预校验**（不写任何表），返回与签发完全同口径的逐项结果
+    及每个候选的名次 / 证据状态 / 时间窗；本模块只写 `conclusion_issuances` 表，
+    **不改写图、评审票或历史快照**
+  - 前端评审室「根因签发」页按名次分组展示候选与实时证据状态，支持仅校验 / 签发、
+    逐项失败原因（含因果链）与已签发记录（根因表、SHA-256、签发说明）展示；评审场列表标记「已签发」
 - **变更提案合并（Change Proposal Merge）**
   - **保存提案**：把画布上的未提交修改（changeset）保存为绑定 `base_version_id` 的提案；
     保存时在写事务内把修改应用到**对应基线**上，复用与普通提交完全相同的整图校验
@@ -165,6 +193,11 @@ SQLite 数据库默认位于 `./data/app.db`，可用环境变量 `DB_PATH` 覆�
 | GET | `/api/reviews/{id}` | 评审场详情：封榜前只含已提交名单/数量，封榜后附 Schulze 结果 |
 | POST | `/api/reviews/{id}/ballots` | 提交 / 覆盖选票（登记评审人 + 全候选严格排序；封榜后 409） |
 | POST | `/api/reviews/{id}/close` | 封榜（写事务校验 `expected_revision` 与最低票数；过期/重复 409） |
+| POST | `/api/reviews/{id}/issuance/validate` | 根因签发只读预校验：逐项返回覆盖/祖先/证据状态原因（不写库） |
+| POST | `/api/reviews/{id}/issuance` | 签发不可变根因结论（写事务内重读全部依据；400 逐项原因 / 未封榜·已签发 409） |
+| GET | `/api/reviews/{id}/issuance` | 查看某评审场的签发记录（含规范化 payload 与 SHA-256；未签发 404） |
+| GET | `/api/issuances` | 全部签发记录摘要（倒序） |
+| GET | `/api/issuances/{id}` | 查看单条签发记录 |
 | GET | `/api/proposals` | 变更提案列表（含未合并 / 已合并、基线、修改项数） |
 | POST | `/api/proposals` | 保存提案（绑定 `base_version_id` 的 changeset，基线整图校验，**不生成版本**） |
 | GET | `/api/proposals/{id}` | 提案详情（含所存 changeset） |
@@ -565,6 +598,121 @@ curl -X POST http://localhost:8000/api/reviews/1/close \
 点击最强路径矩阵单元格查看该方向的见证路径。评审场只读绑定原版本快照，
 **不改写因果图、版本或结论包**。
 
+### 根因结论签发示例
+
+封榜后，从评审场提交最终根因集合与签发说明。建议先调用只读预校验（与签发完全同口径，
+不写库）：
+
+```bash
+curl -X POST http://localhost:8000/api/reviews/1/issuance/validate \
+  -H 'Content-Type: application/json' \
+  -d '{"root_cause_ids": ["n-null"], "note": "封榜共识：空指针异常为最终根因"}'
+```
+
+响应逐项给出 4 项检查与每个候选的名次 / 证据状态 / 有效时间窗：
+
+```json
+{
+  "session_id": 1,
+  "version_id": 1,
+  "review_status": "closed",
+  "already_issued": false,
+  "passed": true,
+  "top_rank_node_ids": ["n-null"],
+  "ranks": [{"rank": 1, "node_ids": ["n-null"]}, {"rank": 2, "node_ids": ["n-code", "n-outage"]}],
+  "checks": [
+    {"key": "session_state", "label": "评审场已封榜、同场未重复签发、签发说明非空",
+     "status": "passed", "passed": true, "reasons": []},
+    {"key": "top_rank_coverage", "label": "集合恰好覆盖最高并列名次",
+     "status": "passed", "passed": true, "reasons": []},
+    {"key": "no_causes_ancestor", "label": "候选之间不存在 causes 祖先关系",
+     "status": "passed", "passed": true, "reasons": []},
+    {"key": "evidence_sufficient", "label": "每个候选证据状态均不为 insufficient / refuted",
+     "status": "passed", "passed": true, "reasons": []}
+  ],
+  "candidates": [
+    {"node_id": "n-null", "rank": 1, "is_top_rank": true, "selected": true,
+     "evidence_status": "disputed", "support_score": 0.9, "refute_score": 0.7,
+     "time_window": {"earliest_time": "2026-09-20T02:00:00Z", "effective_lower": "...", "effective_upper": "..."}}
+  ]
+}
+```
+
+校验通过后正式签发（同一个写事务内重新读取并重算，**不沿用预校验结果**）：
+
+```bash
+curl -X POST http://localhost:8000/api/reviews/1/issuance \
+  -H 'Content-Type: application/json' \
+  -d '{"root_cause_ids": ["n-null"], "note": "封榜共识：空指针异常为最终根因"}'
+```
+
+成功返回 **201** 与不可变记录（节选）：
+
+```json
+{
+  "id": 1,
+  "session_id": 1,
+  "version_id": 1,
+  "note": "封榜共识：空指针异常为最终根因",
+  "root_cause_ids": ["n-null"],
+  "issued_at": "2026-10-01T03:55:57Z",
+  "digest": {"algorithm": "sha256", "value": "9f2c…（64 位十六进制）", "actual": "9f2c…", "match": true},
+  "payload": {
+    "format": "incident-root-cause-issuance",
+    "format_version": 1,
+    "issued_at": "2026-10-01T03:55:57Z",
+    "note": "封榜共识：空指针异常为最终根因",
+    "session": {"id": 1, "title": "支付故障根因排序", "revision": 4, "min_votes": 2, "closed_at": "..."},
+    "version": {"id": 1, "kind": "commit", "message": "初始示例：支付链路中断复盘", "base_id": null, "created_at": "..."},
+    "schulze": {"method": "schulze", "ranks": [{"rank": 1, "node_ids": ["n-null"]}, {}]},
+    "root_causes": [
+      {"node_id": "n-null", "title": "空指针异常", "rank": 1,
+       "evidence_review": {"support_score": 0.9, "refute_score": 0.7, "status": "disputed", "groups": []},
+       "time_window": {"earliest_time": "...", "latest_time": "...", "effective_lower": "...", "effective_upper": "..."}}
+    ]
+  }
+}
+```
+
+任一业务条件不满足返回 **400**，`validation` 与预校验同构，`checks[].reasons[]` 逐项说明：
+
+```json
+{
+  "detail": "根因结论签发校验未通过，已逐项列出原因",
+  "code": "issuance_validation_failed",
+  "validation": {
+    "passed": false,
+    "checks": [
+      {"key": "top_rank_coverage", "status": "failed", "reasons": [
+        {"code": "missing_top_rank", "message": "缺少最高并列名次中的候选：「空指针异常」", "node_ids": ["n-null"]},
+        {"code": "non_top_rank_included", "message": "包含不属于最高并列名次的候选：「配置开关失效」", "node_ids": ["n-config"]}]},
+      {"key": "no_causes_ancestor", "status": "failed", "reasons": [
+        {"code": "causes_ancestor", "message": "「错误版本发布」沿 causes 是「空指针异常」的祖先，…",
+         "ancestor_id": "n-code", "descendant_id": "n-null", "chain_node_ids": ["n-code", "n-null"]}]},
+      {"key": "evidence_sufficient", "status": "failed", "reasons": [
+        {"code": "evidence_refuted", "message": "「配置开关失效」的证据审查状态为 refuted，…",
+         "node_id": "n-config", "evidence_status": "refuted"}]}
+    ]
+  }
+}
+```
+
+拒绝原因码：
+
+| 场景 | HTTP | code |
+| --- | --- | --- |
+| 评审场不存在 / 签发记录不存在 | 404 | `session_not_found` / `issuance_not_found` |
+| 评审场未封榜就签发 | 409 | `session_not_closed` |
+| 同场重复签发（含并发下撞 `UNIQUE(session_id)`） | 409 | `already_issued` |
+| 缺少 / 夹带最高并列名次、非候选、集合重复 | 400 | `missing_top_rank` / `non_top_rank_included` / `not_candidate` / `duplicate_root_cause` |
+| 候选间存在直接或间接 causes 祖先关系（附因果链） | 400 | `causes_ancestor` |
+| 候选证据状态为证据不足 / 已反驳 | 400 | `evidence_insufficient` / `evidence_refuted` |
+| 签发说明为空 | 400 | `empty_note` |
+
+`GET /api/reviews/{id}` 在封榜前后都附带 `issuance` 摘要字段（未签发为 `null`）；
+`GET /api/reviews` 列表每项带 `issued` 布尔。记录只增不改，后续提交 / 回滚 / 合并产生新图版本
+**不影响**已签发记录（payload 与摘要按签发时的绑定版本永久冻结）。
+
 ### 变更提案合并示例
 
 **保存提案**（不生成版本；`changes` 与普通提交的 changeset 完全同构，必须带
@@ -691,9 +839,10 @@ curl -X POST http://localhost:8000/api/proposals/merge \
 ```
 .
 ├── app/
-│   ├── main.py       # FastAPI 路由：提交事务、回滚、下游查询、反事实推演、结论包导出/核验、盲评建场/投票/封榜、静态托管
+│   ├── main.py       # FastAPI 路由：提交事务、回滚、下游查询、反事实推演、结论包导出/核验、盲评建场/投票/封榜、根因签发、静态托管
 │   ├── graph.py      # 图加载、changeset 校验（成环检测/证据字段）、时间窗传播、证据强度审查、BFS 下游、反事实拓扑推演、快照持久化
 │   ├── conclusion.py # 可复算复盘结论包：自包含 payload 收集、规范化 SHA-256 摘要、上传包重建 DAG 重算并逐字段比对（纯只读）
+│   ├── issuance.py   # 根因结论签发：写事务内重读绑定版本/Schulze/证据审查/时间窗并逐项校验，通过后写不可变签发记录（规范化 payload + SHA-256）
 │   ├── review.py     # 根因共识盲评：评审场 CRUD（写事务校验 revision/最低票数）、Schulze 计票（两两偏好/最强路径/逐层并列/确定性见证）
 │   ├── proposals.py  # 变更提案：保存（基线整图校验、不出版本）、三方比较（自动采纳/冲突）、写事务裁决合并（复查状态与基线+重跑整图校验+生成 merge 版本）
 │   ├── database.py   # SQLite 连接、表结构、v1 示例数据、旧库幂等迁移（含 versions.kind 扩展到 merge）
@@ -701,7 +850,7 @@ curl -X POST http://localhost:8000/api/proposals/merge \
 ├── static/
 │   ├── index.html    # 三栏布局：顶栏 / 画布 / 侧栏 + 评审室弹窗
 │   ├── style.css
-│   └── app.js        # 状态管理、SVG 渲染、拖拽/连线、changeset 累计与提交、结论包导出下载与核验展示、盲评建场/投票/封榜与矩阵视图、变更提案保存/预览/三方比较裁决与冲突定位
+│   └── app.js        # 状态管理、SVG 渲染、拖拽/连线、changeset 累计与提交、结论包导出下载与核验展示、盲评建场/投票/封榜与矩阵视图、根因签发校验/签发/记录展示、变更提案保存/预览/三方比较裁决与冲突定位
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -729,6 +878,12 @@ curl -X POST http://localhost:8000/api/proposals/merge \
   - `review_candidates(session_id, node_id)`、`review_reviewers(session_id, reviewer)`
   - `review_ballots(session_id, reviewer, ranking, submitted_at)`，主键 `(session_id, reviewer)`；
     `ranking` 为 JSON 数组（全部候选的严格排序），重复提交即覆盖
+- 根因结论签发（只写本表，不触碰图数据 / 评审票 / 任何历史快照）：
+  - `conclusion_issuances(id, session_id→review_sessions UNIQUE, version_id→versions, note,
+    root_cause_ids(JSON), payload_json(JSON), digest_sha256, created_at)`
+  - 记录**只增不改**（无更新 / 删除接口）；`session_id UNIQUE` 保证同场仅一条；
+    `payload_json` 为规范化（紧凑、键按字典序）结论 payload，`digest_sha256` 为其摘要；
+    `created_at` 与 payload 内 `issued_at` 一致
 
 最新版本 = `MAX(versions.id)`；读取图时只查该版本的行。回滚不修改任何旧行，而是把目标版本的
 nodes/edges 复制到一条新的 rollback 版本中，因此历史始终可追溯。提案合并同理：三方裁决结果
@@ -797,6 +952,25 @@ nodes/edges 复制到一条新的 rollback 版本中，因此历史始终可追�
    该集合必然非空）；候选 ID 仅用于矩阵 / 层内稳定排序与见证路径的确定性选择，不打断并列
 5. **见证**：对任意 `p[i][j] > 0` 的方向，在「`d[u][v] > d[v][u]` 且 `d[u][v] ≥ p[i][j]`」
    的子图上按候选 ID 升序 DFS 取第一条路径 —— 其最弱边恰为 `p[i][j]`，确定性可复现
+
+### 根因结论签发（`issuance.build_validation` / `issue`）
+
+1. **同一写事务重读**（`BEGIN IMMEDIATE`，预校验走只读连接、签发走写事务，二者同口径）：
+   评审场行（状态 / revision）、是否已有签发记录、绑定版本行与该版本**全量快照**、冻结选票
+2. **现算依据**（不使用任何缓存结果）：冻结选票经 `review.schulze_result` 重算 Schulze 名次
+   取最高并列层；版本快照的节点 / 连线按 id 排序后调用与 `/api/state` 同一套
+   `compute_time_windows` / `compute_evidence_review` 重算有效时间窗与证据状态
+3. **逐项校验**：① 集合（去重后）恰好等于最高并列层 —— 缺漏、夹带低层 / 非候选、重复各给
+   独立原因码；② 每对候选在「事件 + causes」子图上做 BFS 传递可达检查（邻接表按 id 排序，
+   命中时返回确定性见证链）；③ 每个候选证据状态属于 `insufficient` / `refuted` 即逐项拒绝。
+   未封榜时业务项标记为 `pending`；空说明、未封榜、同场已签发在 `session_state` 项给出原因
+4. **落库即冻结**：全部通过后组装 payload（签发时间、说明、评审场与版本元数据、Schulze 名次、
+   每个根因的证据审查全量结果与有效时间窗），用与结论包相同的规范化
+   （`conclusion.canonical_json_bytes`：紧凑 UTF-8、键按字典序、整值浮点转整数）计算
+   SHA-256，在同一事务插入 `conclusion_issuances` 一行；根因 id 按字典序存储
+5. **不可变与隔离**：无任何 UPDATE / DELETE 路径；`session_id UNIQUE` 兜底并发重复签发
+   （`IntegrityError` → 409 `already_issued`）；记录绑定的是版本 id 与 payload 快照，
+   后续图版本变化对其无影响；整个流程只写 `conclusion_issuances`，不改图、选票或历史快照
 
 ### 变更提案保存与三方合并（`proposals.save_proposal` / `compute_merge` / `commit_merge`）
 
